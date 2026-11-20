@@ -1,6 +1,6 @@
 import { DynamoDBClient } from "@aws-sdk/client-dynamodb";
 import { DynamoDBDocumentClient, ScanCommand, GetCommand, PutCommand } from "@aws-sdk/lib-dynamodb";
-import { randomUUID } from "crypto";
+import { randomUUID, createHash, createHmac } from "crypto";
 
 const db = DynamoDBDocumentClient.from(new DynamoDBClient({}));
 const TABLE = "WhereWeEatingData";
@@ -20,15 +20,37 @@ async function roomStuff(room) {
   return items;
 }
 
+// Signs a request with this Lambda's built-in AWS identity (its "keycard"), so no API key is needed
+const sha = (s) => createHash("sha256").update(s).digest("hex");
+const hmac = (k, s) => createHmac("sha256", k).update(s).digest();
+function signedHeaders(url, body) {
+  const region = process.env.AWS_REGION, service = "geo-places";
+  const u = new URL(url);
+  const amzDate = new Date().toISOString().replace(/[:-]|\.\d{3}/g, "");
+  const day = amzDate.slice(0, 8);
+  const headers = { "content-type": "application/json", host: u.host, "x-amz-content-sha256": sha(body), "x-amz-date": amzDate };
+  if (process.env.AWS_SESSION_TOKEN) headers["x-amz-security-token"] = process.env.AWS_SESSION_TOKEN;
+  const names = Object.keys(headers).sort();
+  const canonical = ["POST", u.pathname, "", names.map(n => n + ":" + headers[n] + "\n").join(""), names.join(";"), sha(body)].join("\n");
+  const scope = `${day}/${region}/${service}/aws4_request`;
+  const toSign = ["AWS4-HMAC-SHA256", amzDate, scope, sha(canonical)].join("\n");
+  const key = hmac(hmac(hmac(hmac("AWS4" + process.env.AWS_SECRET_ACCESS_KEY, day), region), service), "aws4_request");
+  headers.authorization = `AWS4-HMAC-SHA256 Credential=${process.env.AWS_ACCESS_KEY_ID}/${scope}, SignedHeaders=${names.join(";")}, Signature=` +
+    createHmac("sha256", key).update(toSign).digest("hex");
+  delete headers.host;
+  return headers;
+}
+
 // Asks Amazon Location Service for restaurants near a spot
 async function searchNearby(lat, lng, miles) {
-  const url = "https://places.geo.us-east-1.amazonaws.com/v2/search-nearby?key=" + encodeURIComponent(process.env.LOCATION_KEY);
+  const url = "https://places.geo." + process.env.AWS_REGION + ".amazonaws.com/v2/search-nearby";
   const body = { QueryPosition: [lng, lat], QueryRadius: Math.round(miles * 1609), MaxResults: 20,
                  Filter: { IncludeCategories: ["restaurant"] }, Language: "en" };
-  let res = await fetch(url, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
+  const send = (b) => { const text = JSON.stringify(b); return fetch(url, { method: "POST", headers: signedHeaders(url, text), body: text }); };
+  let res = await send(body);
   if (res.status === 400) { // if the category filter isn't accepted, search everything and keep food places
     delete body.Filter; body.MaxResults = 50;
-    res = await fetch(url, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
+    res = await send(body);
   }
   const data = await res.json();
   if (!res.ok) throw new Error("Restaurant search failed (" + res.status + "): " + (data.message || data.Message || JSON.stringify(data)));

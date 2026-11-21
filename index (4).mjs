@@ -1,0 +1,208 @@
+import { DynamoDBClient } from "@aws-sdk/client-dynamodb";
+import { DynamoDBDocumentClient, ScanCommand, GetCommand, PutCommand, DeleteCommand } from "@aws-sdk/lib-dynamodb";
+import { randomUUID, createHash, createHmac } from "crypto";
+
+const db = DynamoDBDocumentClient.from(new DynamoDBClient({}));
+const TABLE = "WhereWeEatingData";
+const MAX_SEARCHES = 3;          // per room, so nobody can run up your bill
+const MAX_ROOMS_PER_DAY = 10;    // per phone/internet connection
+const MAX_SEARCHES_PER_DAY = 200; // for the whole app, a safety net for your bill
+const MAX_PLACES = 30;           // per room (keeps swiping quick)
+const MAX_MEMBERS = 30;          // per room
+
+// Adds 1 to a daily counter and says whether it's still under the limit
+async function underLimit(name, limit) {
+  const id = "limit#" + name + "#" + new Date().toISOString().slice(0, 10);
+  const item = (await get(id)) || { id, room: "-", type: "limit", count: 0 };
+  if (item.count >= limit) return false;
+  item.count += 1;
+  await put(item);
+  return true;
+}
+
+const get = async (id) => (await db.send(new GetCommand({ TableName: TABLE, Key: { id } }))).Item;
+const put = (item) => db.send(new PutCommand({ TableName: TABLE, Item: item }));
+const del = (id) => db.send(new DeleteCommand({ TableName: TABLE, Key: { id } }));
+
+// Grabs everything that belongs to one room
+async function roomStuff(room) {
+  let items = [], start;
+  do {
+    const page = await db.send(new ScanCommand({ TableName: TABLE, ExclusiveStartKey: start }));
+    items = items.concat(page.Items.filter(x => x.room === room));
+    start = page.LastEvaluatedKey;
+  } while (start);
+  return items;
+}
+
+// Signs a request with this Lambda's built-in AWS identity (its "keycard"), so no API key is needed
+const sha = (s) => createHash("sha256").update(s).digest("hex");
+const hmac = (k, s) => createHmac("sha256", k).update(s).digest();
+function signedHeaders(url, body) {
+  const region = process.env.AWS_REGION, service = "geo-places";
+  const u = new URL(url);
+  const amzDate = new Date().toISOString().replace(/[:-]|\.\d{3}/g, "");
+  const day = amzDate.slice(0, 8);
+  const headers = { "content-type": "application/json", host: u.host, "x-amz-content-sha256": sha(body), "x-amz-date": amzDate };
+  if (process.env.AWS_SESSION_TOKEN) headers["x-amz-security-token"] = process.env.AWS_SESSION_TOKEN;
+  const names = Object.keys(headers).sort();
+  const canonical = ["POST", u.pathname, "", names.map(n => n + ":" + headers[n] + "\n").join(""), names.join(";"), sha(body)].join("\n");
+  const scope = `${day}/${region}/${service}/aws4_request`;
+  const toSign = ["AWS4-HMAC-SHA256", amzDate, scope, sha(canonical)].join("\n");
+  const key = hmac(hmac(hmac(hmac("AWS4" + process.env.AWS_SECRET_ACCESS_KEY, day), region), service), "aws4_request");
+  headers.authorization = `AWS4-HMAC-SHA256 Credential=${process.env.AWS_ACCESS_KEY_ID}/${scope}, SignedHeaders=${names.join(";")}, Signature=` +
+    createHmac("sha256", key).update(toSign).digest("hex");
+  delete headers.host;
+  return headers;
+}
+
+// Asks Amazon Location Service for restaurants near a spot
+async function searchNearby(lat, lng, miles, nextToken) {
+  const url = "https://places.geo." + process.env.AWS_REGION + ".amazonaws.com/v2/search-nearby";
+  const body = { QueryPosition: [lng, lat], QueryRadius: Math.round(miles * 1609), MaxResults: 30,
+                 Filter: { IncludeCategories: ["restaurant"] }, Language: "en", IntendedUse: "Storage" };
+  if (nextToken) body.NextToken = nextToken; // continue where the last search left off
+  const send = (b) => { const text = JSON.stringify(b); return fetch(url, { method: "POST", headers: signedHeaders(url, text), body: text }); };
+  let res = await send(body);
+  if (res.status === 400) { // if the category filter isn't accepted, search everything and keep food places
+    delete body.Filter; // keep NextToken so "search again" still gets the next batch
+    res = await send(body);
+  }
+  const data = await res.json();
+  if (!res.ok) throw new Error("Restaurant search failed (" + res.status + "): " + (data.message || data.Message || JSON.stringify(data)));
+  const places = (data.ResultItems || [])
+    .filter(p => (p.Categories || []).some(c => /restaurant|dining|food|pizza|cafe|coffee|bar|grill|ice_cream|dessert|bakery/i.test(c.Id + c.Name)))
+    .map(p => ({
+      title: p.Title,
+      cuisine: (p.FoodTypes || []).map(f => f.LocalizedName).slice(0, 2).join(", ") ||
+               (p.Categories || []).map(c => c.LocalizedName || c.Name).slice(0, 1).join(""),
+      address: p.Address ? p.Address.Label.replace(p.Title + ", ", "") : "",
+      miles: p.Distance != null ? Math.round(p.Distance / 160.9) / 10 : null,
+      openNow: p.OpeningHours && p.OpeningHours[0] ? p.OpeningHours[0].OpenNow : null
+    }));
+  return { places, nextToken: data.NextToken };
+}
+
+export const handler = async (event) => {
+  let raw = event.body || "{}";
+  if (event.isBase64Encoded) raw = Buffer.from(raw, "base64").toString();
+  const req = JSON.parse(raw);
+  const name = String(req.name || "").trim().slice(0, 20);
+  const room = String(req.room || "").trim().toUpperCase();
+  const ip = event.requestContext?.http?.sourceIp || "unknown";
+
+  try {
+    if (!name) return reply(400, { error: "Enter your name" });
+
+    // CREATE a new room with a random 4-letter code
+    if (req.action === "create") {
+      if (!(await underLimit("rooms-" + ip, MAX_ROOMS_PER_DAY))) return reply(429, { error: "You've made a lot of rooms today. Try again tomorrow!" });
+      const letters = "ABCDEFGHJKLMNPQRSTUVWXYZ"; // no I or O (they look like 1 and 0)
+      let code;
+      do { code = Array.from({ length: 4 }, () => letters[Math.floor(Math.random() * letters.length)]).join(""); }
+      while (await get("room#" + code));
+      await put({ id: "room#" + code, room: code, type: "room", host: name, searches: 0, createdAt: Date.now() });
+      await put({ id: "member#" + code + "#" + name.toLowerCase(), room: code, type: "member", name });
+      return reply(200, { room: code });
+    }
+
+    // Every other action needs a real room
+    const roomItem = await get("room#" + room);
+    if (!roomItem) return reply(404, { error: "No room with code " + room });
+
+    // JOIN a friend's room
+    if (req.action === "join") {
+      const already = (await roomStuff(room)).filter(x => x.type === "member");
+      if (already.length >= MAX_MEMBERS && !already.some(m => m.name.toLowerCase() === name.toLowerCase())) return reply(403, { error: "This room is full" });
+      await put({ id: "member#" + room + "#" + name.toLowerCase(), room, type: "member", name });
+      return reply(200, { room });
+    }
+
+    // FIND restaurants near the host (host only, limited per room)
+    if (req.action === "find") {
+      if (roomItem.host !== name) return reply(403, { error: "Only " + roomItem.host + " (the host) can search" });
+      if (roomItem.searches >= MAX_SEARCHES) return reply(429, { error: "This room already used its " + MAX_SEARCHES + " searches. Add spots by hand!" });
+      if (!(await underLimit("searches-all", MAX_SEARCHES_PER_DAY))) return reply(429, { error: "Search is busy today. Add spots by hand!" });
+      const miles = [1, 2, 5, 10].includes(Number(req.miles)) ? Number(req.miles) : 2;
+      // Same distance as last time? Ask Amazon for the NEXT batch instead of the same closest spots
+      const sameSearch = roomItem.lastMiles === miles && roomItem.nextToken;
+      const { places: found, nextToken } = await searchNearby(Number(req.lat), Number(req.lng), miles, sameSearch ? roomItem.nextToken : undefined);
+      roomItem.searches += 1;
+      roomItem.lastMiles = miles;
+      roomItem.nextToken = nextToken || null;
+      await put(roomItem);
+      const existing = new Set((await roomStuff(room)).filter(x => x.type === "place").map(p => p.title.toLowerCase()));
+      let added = 0;
+      for (const p of found) {
+        if (existing.size >= MAX_PLACES) break;
+        if (existing.has(p.title.toLowerCase())) continue;
+        existing.add(p.title.toLowerCase());
+        await put({ id: "place#" + randomUUID(), room, type: "place", addedBy: "search", createdAt: Date.now() + added, ...p });
+        added++;
+      }
+      return reply(200, { added });
+    }
+
+    // ADD a spot by hand
+    if (req.action === "add") {
+      const title = String(req.title || "").trim().slice(0, 60);
+      if (!title) return reply(400, { error: "Type a restaurant name" });
+      if ((await roomStuff(room)).filter(x => x.type === "place").length >= MAX_PLACES) return reply(403, { error: "This room has enough spots. Start swiping!" });
+      await put({ id: "place#" + randomUUID(), room, type: "place", title, cuisine: String(req.cuisine || "").slice(0, 40),
+                  address: "", miles: null, openNow: null, addedBy: name, createdAt: Date.now() });
+      return reply(200, { ok: true });
+    }
+
+    // VOTE yes or no on a spot
+    if (req.action === "vote") {
+      await put({ id: "vote#" + room + "#" + name.toLowerCase() + "#" + req.placeId, room, type: "vote",
+                  name: name.toLowerCase(), placeId: req.placeId, yes: !!req.yes });
+      return reply(200, { ok: true });
+    }
+
+    // REDO MY VOTES: clears only your swipes so you can swipe again
+    if (req.action === "resetMyVotes") {
+      const mine = (await roomStuff(room)).filter(x => x.type === "vote" && x.name === name.toLowerCase());
+      for (const v of mine) await del(v.id);
+      return reply(200, { cleared: mine.length });
+    }
+
+    // NEW ROUND (host only): clears all restaurants and votes, and gives the room fresh searches
+    if (req.action === "newRound") {
+      if (roomItem.host !== name) return reply(403, { error: "Only " + roomItem.host + " (the host) can start a new round" });
+      const old = (await roomStuff(room)).filter(x => x.type === "vote" || x.type === "place");
+      for (const x of old) await del(x.id);
+      roomItem.searches = 0; roomItem.nextToken = null; roomItem.lastMiles = null;
+      roomItem.round = (roomItem.round || 1) + 1;
+      await put(roomItem);
+      return reply(200, { round: roomItem.round });
+    }
+
+    // STATE: everything the screen needs (checked every few seconds)
+    if (req.action === "state") {
+      const all = await roomStuff(room);
+      const members = all.filter(x => x.type === "member").map(m => m.name);
+      const votes = all.filter(x => x.type === "vote");
+      const places = all.filter(x => x.type === "place").sort((a, b) => a.createdAt - b.createdAt).map(p => {
+        const pv = votes.filter(v => v.placeId === p.id);
+        const yes = pv.filter(v => v.yes).map(v => v.name);
+        return { ...p, yesCount: yes.length, voted: pv.length,
+                 match: members.length >= 2 && yes.length === members.length,
+                 myVote: pv.find(v => v.name === name.toLowerCase())?.yes };
+      });
+      const doneCount = members.filter(m => places.every(p => votes.some(v => v.placeId === p.id && v.name === m.toLowerCase()))).length;
+      return reply(200, { room, host: roomItem.host, round: roomItem.round || 1, searchesLeft: MAX_SEARCHES - roomItem.searches, maxPlaces: MAX_PLACES, members, places, doneCount });
+    }
+
+    return reply(400, { error: "Unknown action" });
+  } catch (err) {
+    console.log(err);
+    return reply(500, { error: err.message });
+  }
+};
+
+const reply = (status, data) => ({
+  statusCode: status,
+  headers: { "Content-Type": "application/json" },
+  body: JSON.stringify(data)
+});

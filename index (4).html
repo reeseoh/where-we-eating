@@ -1,0 +1,351 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, viewport-fit=cover">
+  <title>Where We Eating</title>
+  <!-- These lines make it install like a real app on phones -->
+  <link rel="manifest" href="manifest.json">
+  <link rel="apple-touch-icon" href="icon.png">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-title" content="Where We Eating">
+  <meta name="apple-mobile-web-app-status-bar-style" content="default">
+  <meta name="theme-color" content="#ff5e3a">
+  <style>
+    * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
+    html, body { margin: 0; height: 100%; }
+    body { font-family: -apple-system, system-ui, sans-serif; background: #fff5ef; color: #222;
+           padding: env(safe-area-inset-top) 16px env(safe-area-inset-bottom); overflow-x: hidden; }
+    .screen { display: none; max-width: 480px; margin: 0 auto; min-height: 100vh; padding: 20px 0 30px; flex-direction: column; }
+    .screen.on { display: flex; }
+    h1 { color: #ff5e3a; font-size: 34px; margin: 30px 0 4px; }
+    h2 { margin: 6px 0 12px; }
+    .muted { color: #888; font-size: 14px; }
+    input, select, button { font-size: 17px; padding: 14px; margin: 6px 0; width: 100%; border-radius: 14px; border: 1px solid #e5d5cc; font-family: inherit; }
+    button { background: #ff5e3a; color: white; border: none; font-weight: 700; }
+    button.ghost { background: white; color: #ff5e3a; border: 2px solid #ff5e3a; }
+    button:disabled { opacity: .5; }
+    button.back { background: none; color: #888; width: auto; padding: 8px 0; margin: 0 0 4px; font-weight: 600; font-size: 16px; align-self: flex-start; }
+    .card { background: white; border-radius: 18px; padding: 16px; margin: 8px 0; box-shadow: 0 2px 8px #0001; }
+    .code { font-size: 52px; font-weight: 800; letter-spacing: 10px; color: #ff5e3a; text-align: center; margin: 4px 0; }
+    .chips span { display: inline-block; background: #ffe3d8; border-radius: 20px; padding: 6px 12px; margin: 3px; font-size: 15px; }
+    .row { display: flex; gap: 8px; } .row > * { flex: 1; }
+
+    /* Swipe cards */
+    .deck { position: relative; flex: 1; min-height: 380px; margin: 10px 0; }
+    .swipe { position: absolute; inset: 0; background: white; border-radius: 24px; box-shadow: 0 6px 20px #0002;
+             padding: 24px; display: flex; flex-direction: column; justify-content: center; text-align: center;
+             touch-action: none; user-select: none; transition: transform .25s; }
+    .swipe .emoji { font-size: 80px; }
+    .swipe .title { font-size: 28px; font-weight: 800; margin: 10px 0 6px; }
+    .swipe .stamp { position: absolute; top: 24px; font-size: 32px; font-weight: 900; padding: 4px 12px; border: 4px solid; border-radius: 10px; opacity: 0; }
+    .stamp.yes { left: 20px; color: #2a9d8f; transform: rotate(-15deg); }
+    .stamp.no { right: 20px; color: #e63946; transform: rotate(15deg); }
+    .bigbtns { display: flex; justify-content: center; gap: 40px; }
+    .bigbtns button { width: 76px; height: 76px; border-radius: 50%; font-size: 34px; padding: 0; background: white; box-shadow: 0 4px 12px #0002; }
+
+    .result { display: flex; align-items: center; gap: 12px; }
+    .result .bar { height: 8px; background: #ffe3d8; border-radius: 4px; margin-top: 6px; }
+    .result .bar div { height: 100%; background: #ff5e3a; border-radius: 4px; }
+    .match { background: linear-gradient(135deg, #ff5e3a, #ff9f1c); color: white; text-align: center; }
+    .match a { color: white; font-weight: 700; }
+  </style>
+</head>
+<body>
+
+  <!-- SCREEN 1: HOME -->
+  <div id="home" class="screen on">
+    <h1>Where We Eating? 🍽️</h1>
+    <p class="muted">Swipe on restaurants with friends. When everyone says yes, it's a match.</p>
+    <input id="nameBox" placeholder="Your name" maxlength="20">
+    <button onclick="createRoom()">Start a new room</button>
+    <div class="card" style="margin-top:20px">
+      <b>Joining a friend?</b>
+      <input id="codeBox" placeholder="4-letter room code" maxlength="4" style="text-transform:uppercase; letter-spacing:4px">
+      <button class="ghost" onclick="joinRoom()">Join room</button>
+    </div>
+    <p class="muted" style="text-align:center; margin-top:auto; padding-top:30px"><a href="privacy.html" style="color:#888">Privacy policy</a></p>
+  </div>
+
+  <!-- SCREEN 2: LOBBY -->
+  <div id="lobby" class="screen">
+    <button class="back" onclick="leaveRoom()">← Leave room</button>
+    <div class="muted" style="text-align:center">Room code</div>
+    <div class="code" id="roomCode"></div>
+    <button class="ghost" onclick="shareRoom()">📤 Invite friends</button>
+    <div class="card"><b>Who's here</b><div id="members" class="chips"></div></div>
+
+    <div id="hostBox" class="card">
+      <b>Find restaurants near you</b>
+      <select id="miles"><option value="1">Within 1 mile</option><option value="2" selected>Within 2 miles</option><option value="5">Within 5 miles</option><option value="10">Within 10 miles</option></select>
+      <button id="findBtn" onclick="findNearby()">📍 Find nearby spots</button>
+      <div class="muted" id="searchesLeft"></div>
+    </div>
+    <div id="guestNote" class="card muted"></div>
+
+    <div class="card">
+      <b>Add a spot yourself</b>
+      <div class="row"><input id="addTitle" placeholder="Restaurant"><input id="addCuisine" placeholder="Type (optional)"></div>
+      <button class="ghost" onclick="addSpot()">+ Add</button>
+    </div>
+    <button id="startBtn" onclick="show('swipeScreen'); nextCard()">Start swiping 👉</button>
+    <button id="resultsBtn" class="ghost" onclick="show('results')">📊 See results</button>
+    <button class="back hostOnly" style="align-self:center" onclick="newRound()">🆕 New round</button>
+  </div>
+
+  <!-- SCREEN 3: SWIPE -->
+  <div id="swipeScreen" class="screen">
+    <button class="back" onclick="show('lobby')">← Back to room</button>
+    <div class="muted" style="text-align:center" id="progress"></div>
+    <div class="deck" id="deck"></div>
+    <a id="reviewsLink" target="_blank" rel="noopener" style="display:block; text-align:center; color:#ff5e3a; font-weight:700; margin:0 0 12px; text-decoration:none">⭐ See reviews &amp; photos</a>
+    <div class="bigbtns">
+      <button onclick="decide(false)">❌</button>
+      <button onclick="decide(true)">💚</button>
+    </div>
+    <p class="muted" style="text-align:center">Swipe right = yes · left = no</p>
+  </div>
+
+  <!-- SCREEN 4: RESULTS -->
+  <div id="results" class="screen">
+    <h2>Results</h2>
+    <div class="muted" id="doneCount"></div>
+    <div id="matchBox"></div>
+    <div id="ranking"></div>
+    <button onclick="redoVotes()">🔁 Redo my votes</button>
+    <button class="ghost hostOnly" onclick="newRound()">🆕 New round (clear all spots &amp; votes)</button>
+    <button class="ghost" onclick="show('lobby')">← Back to room (add more spots)</button>
+    <button class="back" style="text-align:center" onclick="leaveRoom()">Leave room</button>
+  </div>
+
+  <script>
+    // PASTE YOUR FUNCTION URL BETWEEN THE QUOTES BELOW
+    const API = "https://brd5ex22hy4smnfurmdxbha57m0wzwwh.lambda-url.us-east-2.on.aws/";
+
+    const $ = (id) => document.getElementById(id);
+    let me = JSON.parse(localStorage.getItem("wwe") || "{}"); // { name, room }
+    let state = null;
+    let queue = [];
+    let current = null;
+    const votedHere = new Set(); // places you've swiped on from this phone
+
+    // Sends a request to your Lambda "brain" and returns its answer
+    async function talk(body) {
+      body.name = me.name; body.room = me.room;
+      const res = await fetch(API, { method: "POST", body: JSON.stringify(body) });
+      const json = await res.json();
+      if (res.status === 404 && body.action !== "join") { alert(json.error + ". Taking you back to the start."); goHome(); throw new Error(json.error); }
+      if (json.error) { alert(json.error); throw new Error(json.error); }
+      return json;
+    }
+
+    function show(id) {
+      document.querySelectorAll(".screen").forEach(s => s.classList.toggle("on", s.id === id));
+      window.scrollTo(0, 0);
+      refresh();
+    }
+
+    function saveMe() { localStorage.setItem("wwe", JSON.stringify(me)); }
+
+    // Clears only YOUR swipes so you can vote again
+    async function redoVotes() {
+      if (!confirm("Clear your votes and swipe again?")) return;
+      await talk({ action: "resetMyVotes" });
+      votedHere.clear();
+      state = await talk({ action: "state" });
+      show("swipeScreen"); nextCard();
+    }
+
+    // Host only: wipes all spots and votes so the same room can be used again
+    async function newRound() {
+      if (!confirm("Start a new round? This clears ALL restaurants and everyone's votes in this room.")) return;
+      await talk({ action: "newRound" });
+      votedHere.clear();
+      show("lobby");
+    }
+
+    // Leaves the current room and goes back to the start screen
+    function leaveRoom() {
+      if (!confirm("Leave room " + me.room + "? You can rejoin later with the same code.")) return;
+      goHome();
+    }
+    function goHome() {
+      delete me.room; saveMe();
+      state = null; votedHere.clear();
+      $("codeBox").value = "";
+      show("home");
+    }
+
+    async function createRoom() {
+      me.name = $("nameBox").value.trim();
+      if (!me.name) return alert("Enter your name first");
+      const r = await talk({ action: "create" });
+      me.room = r.room; saveMe(); show("lobby");
+    }
+
+    async function joinRoom() {
+      me.name = $("nameBox").value.trim();
+      me.room = $("codeBox").value.trim().toUpperCase();
+      if (!me.name) return alert("Enter your name first");
+      await talk({ action: "join" });
+      saveMe(); show("lobby");
+    }
+
+    function shareRoom() {
+      const text = `Where we eating? 🍽️ Join my room: ${me.room}\n${location.href}`;
+      if (navigator.share) navigator.share({ text });
+      else { navigator.clipboard.writeText(text); alert("Copied! Paste it in your group chat."); }
+    }
+
+    // Asks the phone for its location, then asks the brain to search near it
+    function findNearby() {
+      if (!navigator.geolocation) return alert("This phone can't share location. Add spots by hand!");
+      $("findBtn").textContent = "Finding your location..."; $("findBtn").disabled = true;
+      navigator.geolocation.getCurrentPosition(async (pos) => {
+        try {
+          $("findBtn").textContent = "Searching restaurants...";
+          const r = await talk({ action: "find", lat: pos.coords.latitude, lng: pos.coords.longitude, miles: $("miles").value });
+          alert(r.added ? `Found ${r.added} new spots! 🎉 Search again for more.` : "No new spots found. Try a bigger distance.");
+        } finally { resetFind(); refresh(); }
+      }, () => { alert("Location was blocked. Allow location for this app, or add spots by hand."); resetFind(); },
+      { enableHighAccuracy: false, timeout: 15000 });
+    }
+    function resetFind() { $("findBtn").textContent = "📍 Find nearby spots"; $("findBtn").disabled = false; }
+
+    async function addSpot() {
+      const title = $("addTitle").value.trim();
+      const cuisine = $("addCuisine").value;
+      if (!title) return;
+      $("addTitle").value = ""; $("addCuisine").value = "";
+      await talk({ action: "add", title, cuisine });
+      refresh();
+    }
+
+    // Gets the latest room info from the brain and redraws whatever screen is showing
+    async function refresh() {
+      if (!me.room) return;
+      try { state = await talk({ action: "state" }); } catch { return; }
+      // Lobby
+      $("roomCode").textContent = state.room;
+      $("members").innerHTML = "";
+      state.members.forEach(m => { const s = document.createElement("span"); s.textContent = (m === state.host ? "👑 " : "") + m; $("members").appendChild(s); });
+      const isHost = state.host === me.name;
+      $("hostBox").style.display = isHost ? "" : "none";
+      document.querySelectorAll(".hostOnly").forEach(el => el.style.display = isHost ? "" : "none");
+      $("resultsBtn").style.display = state.places.length ? "" : "none";
+      $("guestNote").style.display = isHost ? "none" : "";
+      $("guestNote").textContent = `${state.host} (the host) can search for nearby spots. You can add your own below.`;
+      $("searchesLeft").textContent = `${state.searchesLeft} searches left this round · ${state.places.length}/${state.maxPlaces} spots`;
+      const unvoted = state.places.filter(p => p.myVote === undefined && !votedHere.has(p.id)).length;
+      $("startBtn").textContent = state.places.length ? `Start swiping 👉 (${unvoted} to go, ${state.places.length} total)` : "Add some spots first";
+      $("startBtn").disabled = !state.places.length;
+      // Results
+      if ($("results").classList.contains("on")) drawResults();
+    }
+
+    // A Google Maps search for this restaurant, which shows its star rating, reviews and photos
+    function mapsLink(p) {
+      return "https://www.google.com/maps/search/?api=1&query=" + encodeURIComponent(p.title + " " + (p.address || ""));
+    }
+
+    function emojiFor(p) {
+      const t = (p.title + " " + p.cuisine).toLowerCase();
+      const map = [["pizza","🍕"],["burger","🍔"],["sushi","🍣"],["japan","🍱"],["chinese","🥡"],["thai","🍜"],["ramen","🍜"],["mexic","🌮"],["taco","🌮"],["chipotle","🌯"],["india","🍛"],["ital","🍝"],["ice cream","🍦"],["dessert","🍰"],["coffee","☕"],["cafe","☕"],["bar","🍻"],["chicken","🍗"],["breakfast","🥞"],["salad","🥗"],["korean","🍲"],["bbq","🍖"],["seafood","🦞"]];
+      return (map.find(([k]) => t.includes(k)) || [0, "🍽️"])[1];
+    }
+
+    function nextCard() {
+      queue = state ? state.places.filter(p => p.myVote === undefined && !votedHere.has(p.id)) : [];
+      $("deck").innerHTML = "";
+      if (!queue.length) { show("results"); return; }
+      current = queue[0];
+      $("progress").textContent = `${state.places.length - queue.length + 1} of ${state.places.length}`;
+      const card = document.createElement("div");
+      card.className = "swipe";
+      card.innerHTML = `<div class="stamp yes">YES</div><div class="stamp no">NOPE</div>
+        <div class="emoji"></div><div class="title"></div><div class="muted cuisine" style="font-size:17px"></div>
+        <div class="muted info" style="margin-top:14px"></div><div class="muted addr" style="margin-top:6px"></div>`;
+      card.querySelector(".emoji").textContent = emojiFor(current);
+      card.querySelector(".title").textContent = current.title;
+      card.querySelector(".cuisine").textContent = current.cuisine || "";
+      const bits = [];
+      if (current.miles != null) bits.push(`📍 ${current.miles} mi away`);
+      if (current.openNow === true) bits.push("🟢 Open now");
+      if (current.openNow === false) bits.push("🔴 Closed now");
+      if (current.addedBy !== "search") bits.push(`Added by ${current.addedBy}`);
+      card.querySelector(".info").textContent = bits.join(" · ");
+      card.querySelector(".addr").textContent = current.address || "";
+      makeSwipeable(card);
+      $("deck").appendChild(card);
+      $("reviewsLink").href = mapsLink(current);
+    }
+
+    // Lets you drag the card left or right with your finger
+    function makeSwipeable(card) {
+      let startX = null, dx = 0;
+      card.addEventListener("pointerdown", e => { startX = e.clientX; card.style.transition = "none"; card.setPointerCapture(e.pointerId); });
+      card.addEventListener("pointermove", e => {
+        if (startX === null) return;
+        dx = e.clientX - startX;
+        card.style.transform = `translateX(${dx}px) rotate(${dx / 15}deg)`;
+        card.querySelector(".yes").style.opacity = Math.max(0, dx / 100);
+        card.querySelector(".no").style.opacity = Math.max(0, -dx / 100);
+      });
+      card.addEventListener("pointerup", () => {
+        card.style.transition = "transform .25s";
+        if (Math.abs(dx) > 100) decide(dx > 0);
+        else { card.style.transform = ""; card.querySelectorAll(".stamp").forEach(s => s.style.opacity = 0); }
+        startX = null; dx = 0;
+      });
+    }
+
+    async function decide(yes) {
+      if (!current) return;
+      const card = $("deck").firstChild;
+      if (card) { card.style.transform = `translateX(${yes ? 600 : -600}px) rotate(${yes ? 30 : -30}deg)`; }
+      const place = current; current = null;
+      place.myVote = yes;
+      votedHere.add(place.id);
+      await talk({ action: "vote", placeId: place.id, yes });
+      setTimeout(nextCard, 200);
+    }
+
+    function drawResults() {
+      const total = state.members.length;
+      $("doneCount").textContent = `${state.doneCount} of ${total} friends finished swiping` + (state.doneCount < total ? " · updating live..." : " ✅");
+      const matches = state.places.filter(p => p.match);
+      $("matchBox").innerHTML = "";
+      matches.forEach(p => {
+        const div = document.createElement("div");
+        div.className = "card match";
+        div.innerHTML = `<div style="font-size:40px">🎉</div><div style="font-size:14px">IT'S A MATCH</div><h2></h2><a target="_blank">Open in Maps →</a>`;
+        div.querySelector("h2").textContent = emojiFor(p) + " " + p.title;
+        div.querySelector("a").href = mapsLink(p);
+        $("matchBox").appendChild(div);
+      });
+      if (!matches.length && state.doneCount === total && total > 1) {
+        $("matchBox").innerHTML = `<div class="card">😬 No spot got a yes from everyone. Here's the closest:</div>`;
+      }
+      $("ranking").innerHTML = "";
+      [...state.places].sort((a, b) => b.yesCount - a.yesCount).forEach(p => {
+        const div = document.createElement("div");
+        div.className = "card result";
+        div.innerHTML = `<div style="font-size:30px"></div><div style="flex:1"><b></b> <span class="muted"></span><div class="bar"><div></div></div></div>`;
+        div.firstChild.textContent = emojiFor(p);
+        div.querySelector("b").textContent = p.title;
+        div.querySelector(".muted").textContent = `${p.yesCount}/${total} yes`;
+        div.querySelector(".bar div").style.width = (total ? p.yesCount / total * 100 : 0) + "%";
+        $("ranking").appendChild(div);
+      });
+    }
+
+    // Check for updates every 4 seconds (new friends, new spots, new votes)
+    setInterval(() => { if (!$("home").classList.contains("on") && !$("swipeScreen").classList.contains("on")) refresh(); }, 4000);
+
+    // If you were already in a room, go right back to it
+    if (me.name) $("nameBox").value = me.name;
+    if (me.room) show("lobby");
+  </script>
+</body>
+</html>

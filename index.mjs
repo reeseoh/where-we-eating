@@ -1,24 +1,10 @@
 import { DynamoDBClient } from "@aws-sdk/client-dynamodb";
 import { DynamoDBDocumentClient, ScanCommand, GetCommand, PutCommand } from "@aws-sdk/lib-dynamodb";
-import { randomUUID, createHash, createHmac } from "crypto";
+import { randomUUID } from "crypto";
 
 const db = DynamoDBDocumentClient.from(new DynamoDBClient({}));
 const TABLE = "WhereWeEatingData";
-const MAX_SEARCHES = 3;          // per room, so nobody can run up your bill
-const MAX_ROOMS_PER_DAY = 10;    // per phone/internet connection
-const MAX_SEARCHES_PER_DAY = 200; // for the whole app, a safety net for your bill
-const MAX_PLACES = 60;           // per room
-const MAX_MEMBERS = 30;          // per room
-
-// Adds 1 to a daily counter and says whether it's still under the limit
-async function underLimit(name, limit) {
-  const id = "limit#" + name + "#" + new Date().toISOString().slice(0, 10);
-  const item = (await get(id)) || { id, room: "-", type: "limit", count: 0 };
-  if (item.count >= limit) return false;
-  item.count += 1;
-  await put(item);
-  return true;
-}
+const MAX_SEARCHES = 3; // per room, so nobody can run up your bill
 
 const get = async (id) => (await db.send(new GetCommand({ TableName: TABLE, Key: { id } }))).Item;
 const put = (item) => db.send(new PutCommand({ TableName: TABLE, Item: item }));
@@ -34,42 +20,19 @@ async function roomStuff(room) {
   return items;
 }
 
-// Signs a request with this Lambda's built-in AWS identity (its "keycard"), so no API key is needed
-const sha = (s) => createHash("sha256").update(s).digest("hex");
-const hmac = (k, s) => createHmac("sha256", k).update(s).digest();
-function signedHeaders(url, body) {
-  const region = process.env.AWS_REGION, service = "geo-places";
-  const u = new URL(url);
-  const amzDate = new Date().toISOString().replace(/[:-]|\.\d{3}/g, "");
-  const day = amzDate.slice(0, 8);
-  const headers = { "content-type": "application/json", host: u.host, "x-amz-content-sha256": sha(body), "x-amz-date": amzDate };
-  if (process.env.AWS_SESSION_TOKEN) headers["x-amz-security-token"] = process.env.AWS_SESSION_TOKEN;
-  const names = Object.keys(headers).sort();
-  const canonical = ["POST", u.pathname, "", names.map(n => n + ":" + headers[n] + "\n").join(""), names.join(";"), sha(body)].join("\n");
-  const scope = `${day}/${region}/${service}/aws4_request`;
-  const toSign = ["AWS4-HMAC-SHA256", amzDate, scope, sha(canonical)].join("\n");
-  const key = hmac(hmac(hmac(hmac("AWS4" + process.env.AWS_SECRET_ACCESS_KEY, day), region), service), "aws4_request");
-  headers.authorization = `AWS4-HMAC-SHA256 Credential=${process.env.AWS_ACCESS_KEY_ID}/${scope}, SignedHeaders=${names.join(";")}, Signature=` +
-    createHmac("sha256", key).update(toSign).digest("hex");
-  delete headers.host;
-  return headers;
-}
-
 // Asks Amazon Location Service for restaurants near a spot
-async function searchNearby(lat, lng, miles, nextToken) {
-  const url = "https://places.geo." + process.env.AWS_REGION + ".amazonaws.com/v2/search-nearby";
-  const body = { QueryPosition: [lng, lat], QueryRadius: Math.round(miles * 1609), MaxResults: 50,
-                 Filter: { IncludeCategories: ["restaurant"] }, Language: "en", IntendedUse: "Storage" };
-  if (nextToken) body.NextToken = nextToken; // continue where the last search left off
-  const send = (b) => { const text = JSON.stringify(b); return fetch(url, { method: "POST", headers: signedHeaders(url, text), body: text }); };
-  let res = await send(body);
+async function searchNearby(lat, lng, miles) {
+  const url = "https://places.geo.us-east-1.amazonaws.com/v2/search-nearby?key=" + encodeURIComponent(process.env.LOCATION_KEY);
+  const body = { QueryPosition: [lng, lat], QueryRadius: Math.round(miles * 1609), MaxResults: 20,
+                 Filter: { IncludeCategories: ["restaurant"] }, Language: "en" };
+  let res = await fetch(url, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
   if (res.status === 400) { // if the category filter isn't accepted, search everything and keep food places
-    delete body.Filter; // keep NextToken so "search again" still gets the next batch
-    res = await send(body);
+    delete body.Filter; body.MaxResults = 50;
+    res = await fetch(url, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
   }
   const data = await res.json();
   if (!res.ok) throw new Error("Restaurant search failed (" + res.status + "): " + (data.message || data.Message || JSON.stringify(data)));
-  const places = (data.ResultItems || [])
+  return (data.ResultItems || [])
     .filter(p => (p.Categories || []).some(c => /restaurant|dining|food|pizza|cafe|coffee|bar|grill|ice_cream|dessert|bakery/i.test(c.Id + c.Name)))
     .map(p => ({
       title: p.Title,
@@ -79,7 +42,6 @@ async function searchNearby(lat, lng, miles, nextToken) {
       miles: p.Distance != null ? Math.round(p.Distance / 160.9) / 10 : null,
       openNow: p.OpeningHours && p.OpeningHours[0] ? p.OpeningHours[0].OpenNow : null
     }));
-  return { places, nextToken: data.NextToken };
 }
 
 export const handler = async (event) => {
@@ -88,14 +50,12 @@ export const handler = async (event) => {
   const req = JSON.parse(raw);
   const name = String(req.name || "").trim().slice(0, 20);
   const room = String(req.room || "").trim().toUpperCase();
-  const ip = event.requestContext?.http?.sourceIp || "unknown";
 
   try {
     if (!name) return reply(400, { error: "Enter your name" });
 
     // CREATE a new room with a random 4-letter code
     if (req.action === "create") {
-      if (!(await underLimit("rooms-" + ip, MAX_ROOMS_PER_DAY))) return reply(429, { error: "You've made a lot of rooms today. Try again tomorrow!" });
       const letters = "ABCDEFGHJKLMNPQRSTUVWXYZ"; // no I or O (they look like 1 and 0)
       let code;
       do { code = Array.from({ length: 4 }, () => letters[Math.floor(Math.random() * letters.length)]).join(""); }
@@ -111,8 +71,6 @@ export const handler = async (event) => {
 
     // JOIN a friend's room
     if (req.action === "join") {
-      const already = (await roomStuff(room)).filter(x => x.type === "member");
-      if (already.length >= MAX_MEMBERS && !already.some(m => m.name.toLowerCase() === name.toLowerCase())) return reply(403, { error: "This room is full" });
       await put({ id: "member#" + room + "#" + name.toLowerCase(), room, type: "member", name });
       return reply(200, { room });
     }
@@ -121,19 +79,12 @@ export const handler = async (event) => {
     if (req.action === "find") {
       if (roomItem.host !== name) return reply(403, { error: "Only " + roomItem.host + " (the host) can search" });
       if (roomItem.searches >= MAX_SEARCHES) return reply(429, { error: "This room already used its " + MAX_SEARCHES + " searches. Add spots by hand!" });
-      if (!(await underLimit("searches-all", MAX_SEARCHES_PER_DAY))) return reply(429, { error: "Search is busy today. Add spots by hand!" });
-      const miles = [1, 2, 5, 10].includes(Number(req.miles)) ? Number(req.miles) : 2;
-      // Same distance as last time? Ask Amazon for the NEXT batch instead of the same closest spots
-      const sameSearch = roomItem.lastMiles === miles && roomItem.nextToken;
-      const { places: found, nextToken } = await searchNearby(Number(req.lat), Number(req.lng), miles, sameSearch ? roomItem.nextToken : undefined);
+      const found = await searchNearby(Number(req.lat), Number(req.lng), Number(req.miles) || 2);
       roomItem.searches += 1;
-      roomItem.lastMiles = miles;
-      roomItem.nextToken = nextToken || null;
       await put(roomItem);
       const existing = new Set((await roomStuff(room)).filter(x => x.type === "place").map(p => p.title.toLowerCase()));
       let added = 0;
       for (const p of found) {
-        if (existing.size >= MAX_PLACES) break;
         if (existing.has(p.title.toLowerCase())) continue;
         existing.add(p.title.toLowerCase());
         await put({ id: "place#" + randomUUID(), room, type: "place", addedBy: "search", createdAt: Date.now() + added, ...p });
@@ -146,7 +97,6 @@ export const handler = async (event) => {
     if (req.action === "add") {
       const title = String(req.title || "").trim().slice(0, 60);
       if (!title) return reply(400, { error: "Type a restaurant name" });
-      if ((await roomStuff(room)).filter(x => x.type === "place").length >= MAX_PLACES) return reply(403, { error: "This room has enough spots. Start swiping!" });
       await put({ id: "place#" + randomUUID(), room, type: "place", title, cuisine: String(req.cuisine || "").slice(0, 40),
                   address: "", miles: null, openNow: null, addedBy: name, createdAt: Date.now() });
       return reply(200, { ok: true });
